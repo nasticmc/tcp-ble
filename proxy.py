@@ -116,20 +116,42 @@ class Proxy:
 
     async def _tcp_loop(self) -> None:
         while True:
-            try:
-                log.info("Connecting to companion %s:%d…",
-                         self.tcp_host, self.tcp_port)
-                reader, writer = await asyncio.open_connection(
-                    self.tcp_host, self.tcp_port
-                )
-            except (ConnectionRefusedError, OSError) as exc:
-                log.warning("TCP connect failed: %s — retry in %d s",
-                            exc, TCP_RECONNECT_DELAY)
-                await asyncio.sleep(TCP_RECONNECT_DELAY)
-                continue
+            # Wait for the first BLE packet before opening a TCP connection.
+            # Connecting eagerly leaves the companion with an idle session it
+            # will close on a short timeout (causing rapid reconnect loops).
+            log.info("Waiting for BLE client before connecting to companion…")
+            first = await self._from_ble.get()
+
+            # Connect, retrying on transient failures.
+            while True:
+                try:
+                    log.info("Connecting to companion %s:%d…",
+                             self.tcp_host, self.tcp_port)
+                    reader, writer = await asyncio.open_connection(
+                        self.tcp_host, self.tcp_port
+                    )
+                    break
+                except (ConnectionRefusedError, OSError) as exc:
+                    log.warning("TCP connect failed: %s — retry in %d s",
+                                exc, TCP_RECONNECT_DELAY)
+                    await asyncio.sleep(TCP_RECONNECT_DELAY)
 
             self._tcp_writer = writer
             log.info("TCP connected to companion %s:%d", self.tcp_host, self.tcp_port)
+
+            # Forward the packet that triggered the connection immediately.
+            try:
+                writer.write(first)
+                await writer.drain()
+            except OSError as exc:
+                log.warning("TCP write error on first packet: %s", exc)
+                self._tcp_writer = None
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                continue
 
             t_read  = asyncio.create_task(self._tcp_to_ble(reader))
             t_write = asyncio.create_task(self._ble_to_tcp(writer))
@@ -140,11 +162,12 @@ class Proxy:
                 )
                 for t in pending:
                     t.cancel()
-                # Surface any exception for logging
                 for t in _done:
-                    if t.exception():
+                    if not t.cancelled() and t.exception():
                         log.warning("TCP session ended: %s", t.exception())
             finally:
+                t_read.cancel()
+                t_write.cancel()
                 self._tcp_writer = None
                 try:
                     writer.close()
@@ -152,8 +175,19 @@ class Proxy:
                 except Exception:
                     pass
 
-            log.info("Reconnecting in %d s…", TCP_RECONNECT_DELAY)
-            await asyncio.sleep(TCP_RECONNECT_DELAY)
+            # Flush BLE data that queued up while the session was ending so
+            # it doesn't arrive out-of-context at the start of the next session.
+            n = 0
+            while not self._from_ble.empty():
+                try:
+                    self._from_ble.get_nowait()
+                    n += 1
+                except asyncio.QueueEmpty:
+                    break
+            if n:
+                log.debug("Dropped %d stale BLE packet(s) after session end", n)
+
+            log.info("TCP session ended — will reconnect when BLE client sends data")
 
     # ------------------------------------------------------------------
     # BLE setup
