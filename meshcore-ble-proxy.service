@@ -1,0 +1,25 @@
+[Unit]
+Description=MeshCore TCP-to-BLE proxy
+Documentation=https://github.com/nasticmc/tcp-ble
+After=bluetooth.target network.target
+Requires=bluetooth.target
+
+[Service]
+Type=simple
+User=root
+# ── change BLE_TARGET to your node's MAC address or name substring ──────────
+Environment=BLE_TARGET=MeshCore
+ExecStart=/opt/meshcore-ble-proxy/venv/bin/python \
+    /opt/meshcore-ble-proxy/proxy.py run \
+    "${BLE_TARGET}" \
+    --tcp-host 0.0.0.0 \
+    --tcp-port 4403
+
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meshcore-ble-proxy
+
+[Install]
+WantedBy=multi-user.target
