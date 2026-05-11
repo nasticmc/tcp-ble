@@ -1,0 +1,23 @@
+[Unit]
+Description=MeshCore BLE peripheral-to-TCP proxy
+Documentation=https://github.com/nasticmc/tcp-ble
+After=bluetooth.target network.target
+Requires=bluetooth.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/meshcore-ble-proxy/venv/bin/python \
+    /opt/meshcore-ble-proxy/proxy.py \
+    --tcp-host 127.0.0.1 \
+    --tcp-port 5000 \
+    --ble-name MeshCore
+
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meshcore-ble-proxy
+
+[Install]
+WantedBy=multi-user.target
