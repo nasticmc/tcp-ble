@@ -11,7 +11,8 @@ echo "==> Installing system packages…"
 sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip \
-    bluez libglib2.0-dev libdbus-1-dev
+    bluez libglib2.0-dev libdbus-1-dev \
+    python3-dbus python3-gi gir1.2-glib-2.0
 
 # bless uses BlueZ's experimental D-Bus GATT server API; enable it.
 BTOPTS_FILE="/etc/bluetooth/main.conf"
@@ -31,7 +32,12 @@ sudo cp proxy.py "$INSTALL_DIR/"
 sudo cp requirements.txt "$INSTALL_DIR/"
 
 echo "==> Creating Python virtual environment…"
-sudo python3 -m venv "$VENV"
+# Recreate venv if it exists without system-site-packages (needed for python3-gi).
+if [ -d "$VENV" ] && ! grep -q "include-system-site-packages = true" "$VENV/pyvenv.cfg" 2>/dev/null; then
+    echo "    Recreating venv with --system-site-packages…"
+    sudo rm -rf "$VENV"
+fi
+sudo python3 -m venv --system-site-packages "$VENV"
 sudo "$VENV/bin/pip" install --quiet --upgrade pip
 sudo "$VENV/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
 

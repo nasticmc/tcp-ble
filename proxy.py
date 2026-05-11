@@ -23,7 +23,17 @@ import argparse
 import asyncio
 import logging
 import sys
+import threading
 from typing import Any
+
+try:
+    import dbus
+    import dbus.service
+    import dbus.mainloop.glib
+    from gi.repository import GLib as _GLib
+    _DBUS_AVAILABLE = True
+except ImportError:
+    _DBUS_AVAILABLE = False
 
 from bless import (
     BlessGATTCharacteristic,
@@ -32,7 +42,7 @@ from bless import (
     GATTCharacteristicProperties,
 )
 
-NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+NUS_SERVICE_UUID  = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # phone → companion
 NUS_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # companion → phone
 
@@ -40,6 +50,70 @@ TCP_RECONNECT_DELAY = 5   # seconds between TCP reconnect attempts
 TCP_READ_SIZE       = 512 # bytes per read from companion
 
 log = logging.getLogger("meshcore-proxy")
+
+
+# ---------------------------------------------------------------------------
+# BlueZ Just-Works pairing agent
+# ---------------------------------------------------------------------------
+
+_AGENT_PATH  = "/com/meshcore/pairingagent"
+_AGENT_IFACE = "org.bluez.Agent1"
+_CAPABILITY  = "NoInputNoOutput"
+
+
+if _DBUS_AVAILABLE:
+    class _PairingAgent(dbus.service.Object):
+        """Auto-accepts all BLE bond requests (Just-Works pairing, no PIN)."""
+
+        @dbus.service.method(_AGENT_IFACE)
+        def Release(self): pass
+
+        @dbus.service.method(_AGENT_IFACE, in_signature="os")
+        def AuthorizeService(self, device, uuid): pass
+
+        @dbus.service.method(_AGENT_IFACE, in_signature="o", out_signature="s")
+        def RequestPinCode(self, device): return "0000"
+
+        @dbus.service.method(_AGENT_IFACE, in_signature="o", out_signature="u")
+        def RequestPasskey(self, device): return dbus.UInt32(0)
+
+        @dbus.service.method(_AGENT_IFACE, in_signature="ouq")
+        def DisplayPasskey(self, device, passkey, entered): pass
+
+        @dbus.service.method(_AGENT_IFACE, in_signature="os")
+        def DisplayPinCode(self, device, pincode): pass
+
+        @dbus.service.method(_AGENT_IFACE, in_signature="ou")
+        def RequestConfirmation(self, device, passkey): pass
+
+        @dbus.service.method(_AGENT_IFACE, in_signature="o")
+        def RequestAuthorization(self, device): pass
+
+        @dbus.service.method(_AGENT_IFACE)
+        def Cancel(self): pass
+
+
+def _run_pairing_agent() -> None:
+    """Register a Just-Works BlueZ agent and run its GLib event loop.
+
+    Called in a daemon thread so it doesn't block the asyncio loop.
+    """
+    if not _DBUS_AVAILABLE:
+        log.warning("python3-dbus/python3-gi not available — BLE bond requests will fail")
+        return
+    try:
+        bus = dbus.SystemBus()
+        agent = _PairingAgent(bus, _AGENT_PATH)
+        mgr = dbus.Interface(
+            bus.get_object("org.bluez", "/org/bluez"),
+            "org.bluez.AgentManager1",
+        )
+        mgr.RegisterAgent(_AGENT_PATH, _CAPABILITY)
+        mgr.RequestDefaultAgent(_AGENT_PATH)
+        log.info("BlueZ pairing agent registered (Just-Works, no PIN required)")
+        _GLib.MainLoop().run()
+    except Exception as exc:
+        log.warning("BlueZ pairing agent failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +344,13 @@ def main() -> None:
         format="%(asctime)s  %(levelname)-7s  %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if _DBUS_AVAILABLE:
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    threading.Thread(
+        target=_run_pairing_agent, daemon=True, name="bluez-agent"
+    ).start()
+
     proxy = Proxy(
         tcp_host=args.tcp_host,
         tcp_port=args.tcp_port,
