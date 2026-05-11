@@ -128,6 +128,7 @@ class Proxy:
 
         self._server: BlessServer | None = None
         self._tcp_writer: asyncio.StreamWriter | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         # BLE writes arrive in a sync callback; queue them for the async loop.
         self._from_ble: asyncio.Queue[bytes] = asyncio.Queue()
 
@@ -142,10 +143,11 @@ class Proxy:
     def _on_write(self, characteristic: BlessGATTCharacteristic,
                   value: Any, **_kwargs) -> None:
         characteristic.value = value
-        if value:
+        if value and self._loop is not None:
             # Hand off to the asyncio loop without blocking the BLE callback.
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(self._from_ble.put_nowait, bytes(value))
+            # Must use the stored loop reference — get_event_loop() raises
+            # RuntimeError in Python 3.10+ when called from a non-main thread.
+            self._loop.call_soon_threadsafe(self._from_ble.put_nowait, bytes(value))
 
     # ------------------------------------------------------------------
     # BLE → TCP  (drain the queue)
@@ -302,6 +304,7 @@ class Proxy:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
+        self._loop = asyncio.get_running_loop()
         self._server = await self._setup_ble()
         try:
             await self._tcp_loop()
