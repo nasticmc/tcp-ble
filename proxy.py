@@ -97,6 +97,42 @@ if _DBUS_AVAILABLE:
         def Cancel(self): pass
 
 
+def _remove_stale_bonds(bus: "dbus.SystemBus") -> None:
+    """Remove all bonded/paired device records from BlueZ.
+
+    When the Pi restarts it loses its LTK, but the phone still tries to
+    connect with the old key.  SMP rejects it after ~0.5 s before the
+    pairing agent is ever consulted.  Wiping the records forces a clean
+    Just-Works pairing on the next connection attempt.
+    """
+    try:
+        om = dbus.Interface(
+            bus.get_object("org.bluez", "/"),
+            "org.freedesktop.DBus.ObjectManager",
+        )
+        adapter = dbus.Interface(
+            bus.get_object("org.bluez", "/org/bluez/hci0"),
+            "org.bluez.Adapter1",
+        )
+        n = 0
+        for path, ifaces in om.GetManagedObjects().items():
+            if "org.bluez.Device1" not in ifaces:
+                continue
+            props = ifaces["org.bluez.Device1"]
+            if props.get("Paired") or props.get("Bonded"):
+                try:
+                    adapter.RemoveDevice(path)
+                    n += 1
+                    log.debug("Removed bonded device %s (%s)",
+                              props.get("Address", "?"), path)
+                except Exception as e:
+                    log.debug("RemoveDevice %s: %s", path, e)
+        if n:
+            log.info("Cleared %d stale bond(s) — phone will re-pair on next connect", n)
+    except Exception as exc:
+        log.warning("Bond cleanup failed: %s", exc)
+
+
 def _run_pairing_agent() -> None:
     """Register a Just-Works BlueZ agent and run its GLib event loop.
 
@@ -119,9 +155,14 @@ def _run_pairing_agent() -> None:
             )
             adapter_props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(True))
             adapter_props.Set("org.bluez.Adapter1", "PairableTimeout", dbus.UInt32(0))
-            log.info("Adapter set to always-pairable")
+            adapter_props.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(True))
+            adapter_props.Set("org.bluez.Adapter1", "DiscoverableTimeout", dbus.UInt32(0))
+            log.info("Adapter set to always-pairable and always-discoverable")
         except Exception as exc:
-            log.warning("Could not set adapter pairable: %s", exc)
+            log.warning("Could not configure adapter properties: %s", exc)
+
+        # Wipe stale bond records so mismatched LTKs can't cause SMP failures.
+        _remove_stale_bonds(bus)
 
         agent = _PairingAgent(bus, _AGENT_PATH)
         mgr = dbus.Interface(
