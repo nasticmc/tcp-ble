@@ -22,7 +22,6 @@ TX char : 6E400003-B5A3-F393-E0A9-E50E24DCCA9E  (companion → phone notify)
 import argparse
 import asyncio
 import logging
-import sys
 import threading
 from typing import Any
 
@@ -127,7 +126,6 @@ class Proxy:
         self.ble_name = ble_name
 
         self._server: BlessServer | None = None
-        self._tcp_writer: asyncio.StreamWriter | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         # BLE writes arrive in a sync callback; queue them for the async loop.
         self._from_ble: asyncio.Queue[bytes] = asyncio.Queue()
@@ -212,7 +210,6 @@ class Proxy:
                                 exc, TCP_RECONNECT_DELAY)
                     await asyncio.sleep(TCP_RECONNECT_DELAY)
 
-            self._tcp_writer = writer
             log.info("TCP connected to companion %s:%d", self.tcp_host, self.tcp_port)
 
             # Forward the packet that triggered the connection immediately.
@@ -221,7 +218,6 @@ class Proxy:
                 await writer.drain()
             except OSError as exc:
                 log.warning("TCP write error on first packet: %s", exc)
-                self._tcp_writer = None
                 try:
                     writer.close()
                     await writer.wait_closed()
@@ -236,15 +232,15 @@ class Proxy:
                     [t_read, t_write],
                     return_when=asyncio.FIRST_EXCEPTION,
                 )
-                for t in pending:
-                    t.cancel()
                 for t in _done:
                     if not t.cancelled() and t.exception():
                         log.warning("TCP session ended: %s", t.exception())
             finally:
                 t_read.cancel()
                 t_write.cancel()
-                self._tcp_writer = None
+                # Await cancellation before closing the writer so neither task
+                # is mid-drain when the writer is torn down.
+                await asyncio.gather(t_read, t_write, return_exceptions=True)
                 try:
                     writer.close()
                     await writer.wait_closed()
