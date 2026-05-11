@@ -59,6 +59,11 @@ _AGENT_PATH  = "/com/meshcore/pairingagent"
 _AGENT_IFACE = "org.bluez.Agent1"
 _CAPABILITY  = "NoInputNoOutput"
 
+# Set by _run_pairing_agent once the agent is registered (or has failed).
+# main() waits on this before starting BLE so the agent is always in place
+# before the adapter can receive a bond request.
+_agent_ready = threading.Event()
+
 
 if _DBUS_AVAILABLE:
     class _PairingAgent(dbus.service.Object):
@@ -99,9 +104,25 @@ def _run_pairing_agent() -> None:
     """
     if not _DBUS_AVAILABLE:
         log.warning("python3-dbus/python3-gi not available — BLE bond requests will fail")
+        _agent_ready.set()
         return
     try:
         bus = dbus.SystemBus()
+
+        # Keep the adapter pairable indefinitely.  BlueZ's default PairableTimeout
+        # (180 s) causes the adapter to stop accepting bond requests silently, which
+        # makes Android's pairing dialog flash and disappear with BmBondStateEnum.none.
+        try:
+            adapter_props = dbus.Interface(
+                bus.get_object("org.bluez", "/org/bluez/hci0"),
+                "org.freedesktop.DBus.Properties",
+            )
+            adapter_props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(True))
+            adapter_props.Set("org.bluez.Adapter1", "PairableTimeout", dbus.UInt32(0))
+            log.info("Adapter set to always-pairable")
+        except Exception as exc:
+            log.warning("Could not set adapter pairable: %s", exc)
+
         agent = _PairingAgent(bus, _AGENT_PATH)
         mgr = dbus.Interface(
             bus.get_object("org.bluez", "/org/bluez"),
@@ -110,9 +131,11 @@ def _run_pairing_agent() -> None:
         mgr.RegisterAgent(_AGENT_PATH, _CAPABILITY)
         mgr.RequestDefaultAgent(_AGENT_PATH)
         log.info("BlueZ pairing agent registered (Just-Works, no PIN required)")
+        _agent_ready.set()
         _GLib.MainLoop().run()
     except Exception as exc:
         log.warning("BlueZ pairing agent failed: %s", exc)
+        _agent_ready.set()
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +372,7 @@ def main() -> None:
     threading.Thread(
         target=_run_pairing_agent, daemon=True, name="bluez-agent"
     ).start()
+    _agent_ready.wait(timeout=5.0)
 
     proxy = Proxy(
         tcp_host=args.tcp_host,
