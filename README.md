@@ -63,19 +63,48 @@ proxy.py [options]
   --tcp-host HOST    Companion TCP host  (default: 127.0.0.1)
   --tcp-port PORT    Companion TCP port  (default: 5000)
   --ble-name NAME    BLE advertised name (default: MeshCore)
+  --ble-pin  PIN     6-digit passkey for MITM pairing (default: 123456)
   --log-level LEVEL  DEBUG / INFO / WARNING / ERROR (default: INFO)
 ```
 
 ## How it works
 
-| Direction | Path | Detail |
-|-----------|------|--------|
-| Phone → Companion | BLE write → TCP write | Phone writes to the NUS **RX** characteristic; proxy forwards bytes to companion over TCP |
-| Companion → Phone | TCP read → BLE notify | Proxy reads bytes from companion and pushes them to the phone via NUS **TX** notifications |
+MeshCore uses **two different wire formats** for the same payload:
+
+| Transport | Framing |
+|-----------|---------|
+| BLE NUS   | One ATT write/notify = one whole frame, no header. Max 172 bytes. |
+| TCP / serial companion | `[type:1B][length:LE16][payload...]` — type `0x3C` for phone→radio, `0x3E` for radio→phone. |
+
+The proxy translates between the two:
+
+| Direction | Path | Translation |
+|-----------|------|------------|
+| Phone → Companion | BLE write → TCP write | Wrap each BLE payload as `0x3C, len_lo, len_hi, payload` and send to TCP. |
+| Companion → Phone | TCP read → BLE notify | Stateful parser: find `0x3E`, read 16-bit LE length, emit each payload as one notify. |
+
+Without this translation the companion's `<`/`>` frame parser desyncs as soon
+as a payload byte happens to look like a frame marker, which silently corrupts
+the session — usually right at the first `DeviceQuery` exchange.
 
 The proxy reconnects to the companion TCP socket automatically on failure.
 BLE writes that arrive while TCP is reconnecting are queued and flushed once
 the connection is restored.
+
+## Pairing
+
+The official MeshCore firmware advertises **DisplayOnly + MITM + bonded** with
+a static passkey (`ESP_LE_AUTH_REQ_SC_MITM_BOND` on ESP32, `setMITM(true) +
+DisplayOnly` on nRF52). The proxy registers a matching BlueZ agent so the
+phone sees the same IO-capability profile. On first connect the phone is
+prompted to enter the 6-digit PIN from `--ble-pin`.
+
+If BlueZ generates its own LESC passkey instead of using the static one, the
+proxy logs the actual number at INFO level — watch `journalctl -u
+meshcore-ble-proxy -f` and enter what's printed there.
+
+Stale bond records are wiped at startup so a Pi reboot (which loses its LTK)
+doesn't cause the phone's old bond to be rejected silently by SMP.
 
 ## BlueZ note
 

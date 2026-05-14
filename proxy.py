@@ -22,6 +22,7 @@ TX char : 6E400003-B5A3-F393-E0A9-E50E24DCCA9E  (companion → phone notify)
 import argparse
 import asyncio
 import logging
+import struct
 import threading
 from typing import Any
 
@@ -45,6 +46,24 @@ NUS_SERVICE_UUID  = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # phone → companion
 NUS_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # companion → phone
 
+# MeshCore wire format.
+#
+# On BLE the payload is unframed: each ATT write/notify carries exactly one
+# logical frame (firmware: src/helpers/{esp32,nrf52}/SerialBLEInterface.cpp).
+# On the companion's TCP/serial side the same payload is wrapped in a 3-byte
+# header (firmware: src/helpers/ArduinoSerialInterface.cpp; client:
+# meshcore.js src/connection/tcp_connection.js):
+#
+#     [type:1B] [length:LE16] [payload...]
+#         0x3C '<'  app  -> radio   (phone → companion direction)
+#         0x3E '>'  radio -> app    (companion → phone direction)
+#
+# The proxy must translate between the two — a naïve byte copy desyncs the
+# companion's frame parser as soon as a payload byte happens to look like '<'.
+MC_MAX_FRAME_SIZE      = 172   # firmware BaseSerialInterface.h MAX_FRAME_SIZE
+MC_FRAME_TYPE_TO_RADIO   = 0x3C  # phone -> companion
+MC_FRAME_TYPE_FROM_RADIO = 0x3E  # companion -> phone
+
 TCP_RECONNECT_DELAY = 5   # seconds between TCP reconnect attempts
 TCP_READ_SIZE       = 512 # bytes per read from companion
 
@@ -52,12 +71,18 @@ log = logging.getLogger("meshcore-proxy")
 
 
 # ---------------------------------------------------------------------------
-# BlueZ Just-Works pairing agent
+# BlueZ DisplayOnly pairing agent (matches MeshCore firmware IO-cap)
 # ---------------------------------------------------------------------------
 
 _AGENT_PATH  = "/com/meshcore/pairingagent"
 _AGENT_IFACE = "org.bluez.Agent1"
-_CAPABILITY  = "NoInputNoOutput"
+
+# Real MeshCore firmware advertises DisplayOnly + MITM + bonded with a static
+# passkey (ESP32: ESP_LE_AUTH_REQ_SC_MITM_BOND + setStaticPIN; nRF52:
+# setMITM(true) + setIOCaps(true,false,false)). Mimicking that capability is
+# what lets phones that previously bonded to a real node bond with the proxy
+# without the SMP-MITM mismatch that silently breaks Just-Works.
+_CAPABILITY  = "DisplayOnly"
 
 # Set by _run_pairing_agent once the agent is registered (or has failed).
 # main() waits on this before starting BLE so the agent is always in place
@@ -67,7 +92,12 @@ _agent_ready = threading.Event()
 
 if _DBUS_AVAILABLE:
     class _PairingAgent(dbus.service.Object):
-        """Auto-accepts all BLE bond requests (Just-Works pairing, no PIN)."""
+        """DisplayOnly pairing agent with a fixed passkey."""
+
+        def __init__(self, bus, path, pin: str):
+            super().__init__(bus, path)
+            self._pin     = pin
+            self._pin_int = int(pin)
 
         @dbus.service.method(_AGENT_IFACE)
         def Release(self): pass
@@ -76,16 +106,33 @@ if _DBUS_AVAILABLE:
         def AuthorizeService(self, device, uuid): pass
 
         @dbus.service.method(_AGENT_IFACE, in_signature="o", out_signature="s")
-        def RequestPinCode(self, device): return "0000"
+        def RequestPinCode(self, device):
+            log.info("BlueZ requested PIN for %s — supplying %s", device, self._pin)
+            return self._pin
 
         @dbus.service.method(_AGENT_IFACE, in_signature="o", out_signature="u")
-        def RequestPasskey(self, device): return dbus.UInt32(0)
+        def RequestPasskey(self, device):
+            log.info("BlueZ requested passkey for %s — supplying %06d",
+                     device, self._pin_int)
+            return dbus.UInt32(self._pin_int)
 
         @dbus.service.method(_AGENT_IFACE, in_signature="ouq")
-        def DisplayPasskey(self, device, passkey, entered): pass
+        def DisplayPasskey(self, device, passkey, entered):
+            # LESC: BlueZ generates the passkey itself. If it doesn't match
+            # the static PIN, log it loudly so the user can enter the right
+            # number on the phone.
+            shown = int(passkey)
+            if shown != self._pin_int:
+                log.warning("Pairing %s: phone must enter PASSKEY %06d "
+                            "(BlueZ generated, not the configured static PIN)",
+                            device, shown)
+            else:
+                log.info("Pairing %s: phone must enter PASSKEY %06d",
+                         device, shown)
 
         @dbus.service.method(_AGENT_IFACE, in_signature="os")
-        def DisplayPinCode(self, device, pincode): pass
+        def DisplayPinCode(self, device, pincode):
+            log.info("Pairing %s: phone must enter PIN %s", device, pincode)
 
         @dbus.service.method(_AGENT_IFACE, in_signature="ou")
         def RequestConfirmation(self, device, passkey): pass
@@ -133,8 +180,8 @@ def _remove_stale_bonds(bus: "dbus.SystemBus") -> None:
         log.warning("Bond cleanup failed: %s", exc)
 
 
-def _run_pairing_agent() -> None:
-    """Register a Just-Works BlueZ agent and run its GLib event loop.
+def _run_pairing_agent(pin: str) -> None:
+    """Register a DisplayOnly BlueZ agent and run its GLib event loop.
 
     Called in a daemon thread so it doesn't block the asyncio loop.
     """
@@ -164,14 +211,14 @@ def _run_pairing_agent() -> None:
         # Wipe stale bond records so mismatched LTKs can't cause SMP failures.
         _remove_stale_bonds(bus)
 
-        agent = _PairingAgent(bus, _AGENT_PATH)
+        agent = _PairingAgent(bus, _AGENT_PATH, pin)
         mgr = dbus.Interface(
             bus.get_object("org.bluez", "/org/bluez"),
             "org.bluez.AgentManager1",
         )
         mgr.RegisterAgent(_AGENT_PATH, _CAPABILITY)
         mgr.RequestDefaultAgent(_AGENT_PATH)
-        log.info("BlueZ pairing agent registered (Just-Works, no PIN required)")
+        log.info("BlueZ pairing agent registered (DisplayOnly, static PIN %s)", pin)
         _agent_ready.set()
         _GLib.MainLoop().run()
     except Exception as exc:
@@ -206,38 +253,71 @@ class Proxy:
                   value: Any, **_kwargs) -> None:
         characteristic.value = value
         if value and self._loop is not None:
-            # Hand off to the asyncio loop without blocking the BLE callback.
-            # Must use the stored loop reference — get_event_loop() raises
-            # RuntimeError in Python 3.10+ when called from a non-main thread.
+            # One BLE write == one logical MeshCore frame. Hand off to the
+            # asyncio loop without blocking the BLE callback. Must use the
+            # stored loop reference — get_event_loop() raises RuntimeError in
+            # Python 3.10+ when called from a non-main thread.
             self._loop.call_soon_threadsafe(self._from_ble.put_nowait, bytes(value))
 
     # ------------------------------------------------------------------
-    # BLE → TCP  (drain the queue)
+    # BLE → TCP  (wrap each frame in the companion's 3-byte header)
     # ------------------------------------------------------------------
 
     async def _ble_to_tcp(self, writer: asyncio.StreamWriter) -> None:
         while True:
-            data = await self._from_ble.get()
+            payload = await self._from_ble.get()
             if writer.is_closing():
-                log.warning("TCP closing, dropping %d bytes from phone", len(data))
+                log.warning("TCP closing, dropping %d-byte frame from phone",
+                            len(payload))
                 continue
+            if len(payload) > MC_MAX_FRAME_SIZE:
+                # Firmware silently drops oversize frames; surface it instead.
+                log.warning("Dropping oversize BLE frame: %d bytes > %d",
+                            len(payload), MC_MAX_FRAME_SIZE)
+                continue
+            header = struct.pack("<BH", MC_FRAME_TYPE_TO_RADIO, len(payload))
             try:
-                writer.write(data)
+                writer.write(header + payload)
                 await writer.drain()
             except OSError as exc:
                 log.warning("TCP write error: %s", exc)
                 raise
 
     # ------------------------------------------------------------------
-    # TCP → BLE  (read companion, notify phone)
+    # TCP → BLE  (parse 0x3E framed stream, notify one frame per write)
     # ------------------------------------------------------------------
 
     async def _tcp_to_ble(self, reader: asyncio.StreamReader) -> None:
+        buf = bytearray()
         while True:
-            data = await reader.read(TCP_READ_SIZE)
-            if not data:
+            chunk = await reader.read(TCP_READ_SIZE)
+            if not chunk:
                 raise EOFError("Companion closed connection")
-            await self._ble_notify(data)
+            buf.extend(chunk)
+
+            while True:
+                # Resync to a frame start byte. Anything else is stray data
+                # that would desync the phone's BLE-side parser.
+                while buf and buf[0] != MC_FRAME_TYPE_FROM_RADIO:
+                    log.warning("TCP resync: dropping stray byte 0x%02x", buf[0])
+                    del buf[0]
+                if len(buf) < 3:
+                    break  # need at least type + length
+
+                length = buf[1] | (buf[2] << 8)
+                if length > MC_MAX_FRAME_SIZE:
+                    # Almost certainly a bogus length from a desync. Skip the
+                    # type byte and rescan from the next position.
+                    log.warning("TCP frame length %d > MAX_FRAME_SIZE (%d); "
+                                "resyncing", length, MC_MAX_FRAME_SIZE)
+                    del buf[0]
+                    continue
+                if len(buf) < 3 + length:
+                    break  # incomplete frame, wait for more
+
+                payload = bytes(buf[3:3 + length])
+                del buf[:3 + length]
+                await self._ble_notify(payload)
 
     async def _ble_notify(self, data: bytes) -> None:
         if self._server is None:
@@ -276,10 +356,19 @@ class Proxy:
 
             log.info("TCP connected to companion %s:%d", self.tcp_host, self.tcp_port)
 
-            # Forward the packet that triggered the connection immediately.
+            # Forward the frame that triggered the connection immediately,
+            # wrapping it in the companion's 3-byte header like _ble_to_tcp.
+            if len(first) > MC_MAX_FRAME_SIZE:
+                log.warning("Dropping oversize first BLE frame: %d bytes > %d",
+                            len(first), MC_MAX_FRAME_SIZE)
+                first = b""
             try:
-                writer.write(first)
-                await writer.drain()
+                if first:
+                    writer.write(
+                        struct.pack("<BH", MC_FRAME_TYPE_TO_RADIO, len(first))
+                        + first
+                    )
+                    await writer.drain()
             except OSError as exc:
                 log.warning("TCP write error on first packet: %s", exc)
                 try:
@@ -394,6 +483,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="BLE advertised name (what the phone sees)",
     )
     p.add_argument(
+        "--ble-pin", default="123456",
+        help="Static 6-digit passkey for MITM-bonded pairing. The phone will "
+             "be prompted to enter this number on first connect.",
+    )
+    p.add_argument(
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
@@ -408,10 +502,16 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
+    if not (args.ble_pin.isdigit() and len(args.ble_pin) == 6):
+        raise SystemExit(
+            f"--ble-pin must be exactly 6 digits, got {args.ble_pin!r}"
+        )
+
     if _DBUS_AVAILABLE:
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     threading.Thread(
-        target=_run_pairing_agent, daemon=True, name="bluez-agent"
+        target=_run_pairing_agent, args=(args.ble_pin,),
+        daemon=True, name="bluez-agent",
     ).start()
     _agent_ready.wait(timeout=5.0)
 
