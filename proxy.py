@@ -22,8 +22,10 @@ TX char : 6E400003-B5A3-F393-E0A9-E50E24DCCA9E  (companion → phone notify)
 import argparse
 import asyncio
 import logging
+import signal
 import struct
 import threading
+import time
 from typing import Any
 
 try:
@@ -200,6 +202,21 @@ def _run_pairing_agent(pin: str) -> None:
                 bus.get_object("org.bluez", "/org/bluez/hci0"),
                 "org.freedesktop.DBus.Properties",
             )
+            # Power-cycle the adapter to flush any stale GATT application or
+            # advertisement registration left over from a previous crash.  BlueZ
+            # normally removes these when the owning D-Bus connection closes, but
+            # on some BlueZ versions the state persists and causes
+            # RegisterAdvertisement to fail with "Failed to register advertisement"
+            # on the next startup.
+            try:
+                adapter_props.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(False))
+                time.sleep(0.5)
+                adapter_props.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(True))
+                time.sleep(1.5)
+                log.info("Adapter power-cycled to clear stale BLE state")
+            except Exception as exc:
+                log.warning("Adapter power cycle failed: %s", exc)
+
             adapter_props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(True))
             adapter_props.Set("org.bluez.Adapter1", "PairableTimeout", dbus.UInt32(0))
             adapter_props.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(True))
@@ -444,7 +461,17 @@ class Proxy:
             GATTAttributePermissions.readable,
         )
 
-        await server.start()
+        for attempt in range(1, 4):
+            try:
+                await server.start()
+                break
+            except Exception as exc:
+                if attempt >= 3:
+                    raise
+                log.warning("BLE start attempt %d/3 failed (%s) — retrying in 3 s",
+                            attempt, exc)
+                await asyncio.sleep(3)
+
         log.info("BLE advertising as %r", self.ble_name)
         return server
 
@@ -452,8 +479,19 @@ class Proxy:
     # Entry point
     # ------------------------------------------------------------------
 
+    def _on_asyncio_error(self, loop: asyncio.AbstractEventLoop,
+                          context: dict) -> None:
+        exc = context.get("exception")
+        if exc is not None:
+            log.error("Unhandled asyncio error [%s]: %s", type(exc).__name__, exc)
+        else:
+            log.error("Asyncio error: %s", context.get("message", "(no message)"))
+
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
+        # Prevent exceptions raised inside bless's internal asyncio callbacks
+        # from reaching the default handler, which stops the loop.
+        self._loop.set_exception_handler(self._on_asyncio_error)
         self._server = await self._setup_ble()
         try:
             await self._tcp_loop()
@@ -506,6 +544,12 @@ def main() -> None:
         raise SystemExit(
             f"--ble-pin must be exactly 6 digits, got {args.ble_pin!r}"
         )
+
+    # Make SIGTERM (systemd stop/restart) behave like Ctrl-C so the finally
+    # block in Proxy.run() always calls server.stop() and unregisters the BLE
+    # advertisement.  Without this, a systemd-initiated stop bypasses cleanup
+    # and leaves BlueZ with a stale advertisement that blocks the next startup.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
 
     if _DBUS_AVAILABLE:
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
