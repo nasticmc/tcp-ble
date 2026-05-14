@@ -69,6 +69,9 @@ MC_FRAME_TYPE_FROM_RADIO = 0x3E  # companion -> phone
 TCP_RECONNECT_DELAY = 5   # seconds between TCP reconnect attempts
 TCP_READ_SIZE       = 512 # bytes per read from companion
 
+BLE_NOTIFY_QUEUE_MAXSIZE = 256   # backpressure cap; drops oldest on overflow
+BLE_INTER_NOTIFY_DELAY   = 0.020 # 20 ms — one BLE connection interval
+
 log = logging.getLogger("meshcore-proxy")
 
 
@@ -257,6 +260,10 @@ class Proxy:
         self._loop: asyncio.AbstractEventLoop | None = None
         # BLE writes arrive in a sync callback; queue them for the async loop.
         self._from_ble: asyncio.Queue[bytes] = asyncio.Queue()
+        # Outbound BLE frames are drained by a single writer task to respect
+        # the BLE connection interval and avoid silently dropped notifies.
+        self._to_ble: asyncio.Queue[bytes] = asyncio.Queue(maxsize=BLE_NOTIFY_QUEUE_MAXSIZE)
+        self._ble_writer_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # BLE callbacks (called synchronously by bless)
@@ -334,7 +341,20 @@ class Proxy:
 
                 payload = bytes(buf[3:3 + length])
                 del buf[:3 + length]
-                await self._ble_notify(payload)
+                self._enqueue_ble_notify(payload)
+
+    def _enqueue_ble_notify(self, data: bytes) -> None:
+        try:
+            self._to_ble.put_nowait(data)
+        except asyncio.QueueFull:
+            log.warning("BLE notify queue full; dropping %d-byte frame", len(data))
+
+    async def _ble_writer_loop(self) -> None:
+        while True:
+            data = await self._to_ble.get()
+            await self._ble_notify(data)
+            if not self._to_ble.empty():
+                await asyncio.sleep(BLE_INTER_NOTIFY_DELAY)
 
     async def _ble_notify(self, data: bytes) -> None:
         if self._server is None:
@@ -372,6 +392,7 @@ class Proxy:
                     await asyncio.sleep(TCP_RECONNECT_DELAY)
 
             log.info("TCP connected to companion %s:%d", self.tcp_host, self.tcp_port)
+            self._ble_writer_task = asyncio.create_task(self._ble_writer_loop())
 
             # Forward the frame that triggered the connection immediately,
             # wrapping it in the companion's 3-byte header like _ble_to_tcp.
@@ -408,26 +429,32 @@ class Proxy:
             finally:
                 t_read.cancel()
                 t_write.cancel()
+                if self._ble_writer_task:
+                    self._ble_writer_task.cancel()
                 # Await cancellation before closing the writer so neither task
                 # is mid-drain when the writer is torn down.
                 await asyncio.gather(t_read, t_write, return_exceptions=True)
+                if self._ble_writer_task:
+                    await asyncio.gather(self._ble_writer_task, return_exceptions=True)
+                    self._ble_writer_task = None
                 try:
                     writer.close()
                     await writer.wait_closed()
                 except Exception:
                     pass
 
-            # Flush BLE data that queued up while the session was ending so
-            # it doesn't arrive out-of-context at the start of the next session.
+            # Flush queued frames that accumulated while the session was ending
+            # so they don't arrive out-of-context at the start of the next session.
             n = 0
-            while not self._from_ble.empty():
-                try:
-                    self._from_ble.get_nowait()
-                    n += 1
-                except asyncio.QueueEmpty:
-                    break
+            for q in (self._from_ble, self._to_ble):
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                        n += 1
+                    except asyncio.QueueEmpty:
+                        break
             if n:
-                log.debug("Dropped %d stale BLE packet(s) after session end", n)
+                log.debug("Dropped %d stale frame(s) after session end", n)
 
             log.info("TCP session ended — will reconnect when BLE client sends data")
 
