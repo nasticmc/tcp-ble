@@ -81,6 +81,10 @@ log = logging.getLogger("meshcore-proxy")
 
 _AGENT_PATH  = "/com/meshcore/pairingagent"
 _AGENT_IFACE = "org.bluez.Agent1"
+_ADAPTER_PATH = "/org/bluez/hci0"
+_ADAPTER_IFACE = "org.bluez.Adapter1"
+_ADAPTER_POWER_RETRIES = 5
+_ADAPTER_POWER_RETRY_DELAY = 1.0
 
 # Real MeshCore firmware advertises DisplayOnly + MITM + bonded with a static
 # passkey (ESP32: ESP_LE_AUTH_REQ_SC_MITM_BOND + setStaticPIN; nRF52:
@@ -149,6 +153,102 @@ if _DBUS_AVAILABLE:
         def Cancel(self): pass
 
 
+def _adapter_props(bus: "dbus.SystemBus") -> "dbus.Interface":
+    return dbus.Interface(
+        bus.get_object("org.bluez", _ADAPTER_PATH),
+        "org.freedesktop.DBus.Properties",
+    )
+
+
+def _adapter_is_powered(adapter_props: "dbus.Interface") -> bool:
+    return bool(adapter_props.Get(_ADAPTER_IFACE, "Powered"))
+
+
+def _set_adapter_powered(
+    adapter_props: "dbus.Interface",
+    powered: bool,
+    *,
+    retries: int = _ADAPTER_POWER_RETRIES,
+    retry_delay: float = _ADAPTER_POWER_RETRY_DELAY,
+) -> bool:
+    """Set BlueZ Adapter1.Powered and verify the requested state.
+
+    BlueZ can reject a single power-on request while the controller is still
+    settling after a previous state change.  Retrying is safer than leaving the
+    adapter powered off, because BlueZ reports advertisement registration as a
+    generic failure when the controller is not powered.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            adapter_props.Set(_ADAPTER_IFACE, "Powered", dbus.Boolean(powered))
+        except Exception as exc:
+            last_exc = exc
+            log.debug(
+                "Adapter Powered=%s attempt %d/%d failed: %s",
+                powered, attempt, retries, exc,
+            )
+
+        try:
+            if _adapter_is_powered(adapter_props) == powered:
+                return True
+        except Exception as exc:
+            last_exc = exc
+            log.debug(
+                "Adapter Powered=%s verification attempt %d/%d failed: %s",
+                powered, attempt, retries, exc,
+            )
+
+        if attempt < retries:
+            time.sleep(retry_delay)
+
+    log.warning(
+        "Could not set adapter Powered=%s after %d attempt(s): %s",
+        powered, retries, last_exc or "state did not change",
+    )
+    return False
+
+
+def _ensure_adapter_powered() -> bool:
+    """Best-effort adapter power-on helper used before registering BLE objects."""
+    if not _DBUS_AVAILABLE:
+        return True
+    try:
+        return _set_adapter_powered(_adapter_props(dbus.SystemBus()), True)
+    except Exception as exc:
+        log.warning("Could not access BlueZ adapter power state: %s", exc)
+        return False
+
+
+def _configure_adapter(bus: "dbus.SystemBus") -> None:
+    """Prepare hci0 for pairing and advertising without leaving it off."""
+    adapter_props = _adapter_props(bus)
+
+    # Power-cycle only when the controller is already powered.  If powering off
+    # succeeds but powering back on is transiently rejected, keep retrying so a
+    # failed cleanup attempt does not cause the next RegisterAdvertisement call
+    # to fail with the unhelpful "Failed to register advertisement" error.
+    try:
+        if _adapter_is_powered(adapter_props):
+            if _set_adapter_powered(adapter_props, False, retries=2, retry_delay=0.5):
+                time.sleep(0.5)
+    except Exception as exc:
+        log.warning("Adapter power-cycle precheck failed: %s", exc)
+
+    if not _set_adapter_powered(adapter_props, True):
+        log.warning("Adapter is not powered; BLE advertisement registration may fail")
+        return
+
+    try:
+        adapter_props.Set(_ADAPTER_IFACE, "Pairable", dbus.Boolean(True))
+        adapter_props.Set(_ADAPTER_IFACE, "PairableTimeout", dbus.UInt32(0))
+        adapter_props.Set(_ADAPTER_IFACE, "Discoverable", dbus.Boolean(True))
+        adapter_props.Set(_ADAPTER_IFACE, "DiscoverableTimeout", dbus.UInt32(0))
+        log.info("Adapter set to powered, always-pairable, and always-discoverable")
+    except Exception as exc:
+        log.warning("Could not configure adapter properties: %s", exc)
+
+
 def _remove_stale_bonds(bus: "dbus.SystemBus") -> None:
     """Remove all bonded/paired device records from BlueZ.
 
@@ -163,8 +263,8 @@ def _remove_stale_bonds(bus: "dbus.SystemBus") -> None:
             "org.freedesktop.DBus.ObjectManager",
         )
         adapter = dbus.Interface(
-            bus.get_object("org.bluez", "/org/bluez/hci0"),
-            "org.bluez.Adapter1",
+            bus.get_object("org.bluez", _ADAPTER_PATH),
+            _ADAPTER_IFACE,
         )
         n = 0
         for path, ifaces in om.GetManagedObjects().items():
@@ -201,30 +301,7 @@ def _run_pairing_agent(pin: str) -> None:
         # (180 s) causes the adapter to stop accepting bond requests silently, which
         # makes Android's pairing dialog flash and disappear with BmBondStateEnum.none.
         try:
-            adapter_props = dbus.Interface(
-                bus.get_object("org.bluez", "/org/bluez/hci0"),
-                "org.freedesktop.DBus.Properties",
-            )
-            # Power-cycle the adapter to flush any stale GATT application or
-            # advertisement registration left over from a previous crash.  BlueZ
-            # normally removes these when the owning D-Bus connection closes, but
-            # on some BlueZ versions the state persists and causes
-            # RegisterAdvertisement to fail with "Failed to register advertisement"
-            # on the next startup.
-            try:
-                adapter_props.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(False))
-                time.sleep(0.5)
-                adapter_props.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(True))
-                time.sleep(1.5)
-                log.info("Adapter power-cycled to clear stale BLE state")
-            except Exception as exc:
-                log.warning("Adapter power cycle failed: %s", exc)
-
-            adapter_props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(True))
-            adapter_props.Set("org.bluez.Adapter1", "PairableTimeout", dbus.UInt32(0))
-            adapter_props.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(True))
-            adapter_props.Set("org.bluez.Adapter1", "DiscoverableTimeout", dbus.UInt32(0))
-            log.info("Adapter set to always-pairable and always-discoverable")
+            _configure_adapter(bus)
         except Exception as exc:
             log.warning("Could not configure adapter properties: %s", exc)
 
@@ -541,6 +618,8 @@ class Proxy:
 
     async def _setup_ble(self) -> BlessServer:
         for attempt in range(1, 4):
+            if _DBUS_AVAILABLE:
+                await asyncio.to_thread(_ensure_adapter_powered)
             server = await self._build_ble_server()
             try:
                 await server.start()
