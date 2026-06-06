@@ -1,8 +1,8 @@
 [Unit]
 Description=MeshCore BLE peripheral-to-TCP proxy
 Documentation=https://github.com/nasticmc/tcp-ble
-After=bluetooth.target network.target
-Requires=bluetooth.target
+After=bluetooth.service network.target
+Requires=bluetooth.service
 
 [Service]
 Type=simple
