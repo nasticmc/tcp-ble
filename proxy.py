@@ -462,7 +462,7 @@ class Proxy:
     # BLE setup
     # ------------------------------------------------------------------
 
-    async def _setup_ble(self) -> BlessServer:
+    async def _build_ble_server(self) -> BlessServer:
         server = BlessServer(name=self.ble_name)
         server.read_request_func  = self._on_read
         server.write_request_func = self._on_write
@@ -487,20 +487,74 @@ class Proxy:
             None,
             GATTAttributePermissions.readable,
         )
+        return server
 
+    async def _cleanup_failed_ble_start(self, server: BlessServer) -> None:
+        """Undo partial Bless/BlueZ registration after a failed start attempt.
+
+        Bless exports the root GATT application before registering the
+        advertisement.  If advertisement registration fails, retrying
+        ``server.start()`` on the same instance tries to export the root
+        ``org.bluez`` interface again and dbus-next raises the duplicate-export
+        error seen in systemd logs.  Clean up best-effort so the next retry can
+        start from a fresh D-Bus connection.
+        """
+        try:
+            await server.setup_task
+        except Exception as exc:
+            log.debug("BLE setup did not finish before cleanup: %s", exc)
+            return
+
+        app = getattr(server, "app", None)
+        adapter = getattr(server, "adapter", None)
+        bus = getattr(server, "bus", None)
+        if app is None or adapter is None or bus is None:
+            return
+
+        for advertisement in list(getattr(app, "advertisements", [])):
+            try:
+                iface = adapter.get_interface("org.bluez.LEAdvertisingManager1")
+                await iface.call_unregister_advertisement(advertisement.path)
+            except Exception as exc:
+                log.debug("BLE failed-start advertisement unregister skipped: %s", exc)
+            try:
+                bus.unexport(advertisement.path)
+            except Exception as exc:
+                log.debug("BLE failed-start advertisement unexport skipped: %s", exc)
+            try:
+                app.advertisements.remove(advertisement)
+            except ValueError:
+                pass
+
+        try:
+            await app.unregister(adapter)
+        except Exception as exc:
+            log.debug("BLE failed-start application unregister skipped: %s", exc)
+        try:
+            bus.unexport(app.path, app)
+        except Exception as exc:
+            log.debug("BLE failed-start application unexport skipped: %s", exc)
+        try:
+            bus.disconnect()
+        except Exception as exc:
+            log.debug("BLE failed-start D-Bus disconnect skipped: %s", exc)
+
+    async def _setup_ble(self) -> BlessServer:
         for attempt in range(1, 4):
+            server = await self._build_ble_server()
             try:
                 await server.start()
-                break
+                log.info("BLE advertising as %r", self.ble_name)
+                return server
             except Exception as exc:
+                await self._cleanup_failed_ble_start(server)
                 if attempt >= 3:
                     raise
                 log.warning("BLE start attempt %d/3 failed (%s) — retrying in 3 s",
                             attempt, exc)
                 await asyncio.sleep(3)
 
-        log.info("BLE advertising as %r", self.ble_name)
-        return server
+        raise RuntimeError("unreachable BLE start retry state")
 
     # ------------------------------------------------------------------
     # Entry point
