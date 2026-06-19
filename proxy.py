@@ -85,6 +85,7 @@ _ADAPTER_PATH = "/org/bluez/hci0"
 _ADAPTER_IFACE = "org.bluez.Adapter1"
 _ADAPTER_POWER_RETRIES = 5
 _ADAPTER_POWER_RETRY_DELAY = 1.0
+_ADAPTER_RESET_SETTLE_DELAY = 2.0
 
 # Real MeshCore firmware advertises DisplayOnly + MITM + bonded with a static
 # passkey (ESP32: ESP_LE_AUTH_REQ_SC_MITM_BOND + setStaticPIN; nRF52:
@@ -262,6 +263,39 @@ def _configure_adapter(bus: "dbus.SystemBus") -> None:
         log.info("Adapter set to powered and always-pairable")
     except Exception as exc:
         log.warning("Could not configure adapter properties: %s", exc)
+
+
+def _is_advertisement_registration_failure(exc: Exception) -> bool:
+    """Return True for BlueZ's generic RegisterAdvertisement failure."""
+    return "failed to register advertisement" in str(exc).lower()
+
+
+def _recover_adapter_after_advertisement_failure() -> None:
+    """Reset hci0 after BlueZ rejects LE advertisement registration.
+
+    BlueZ can keep a stale LE advertising instance or controller state after a
+    fast service restart.  Subsequent RegisterAdvertisement calls then fail with
+    only the generic ``Failed to register advertisement`` message.  A short
+    hci0 power cycle clears BlueZ/controller advertising state without touching
+    Wi-Fi or restarting bluetoothd.
+    """
+    if not _DBUS_AVAILABLE:
+        return
+
+    try:
+        bus = dbus.SystemBus()
+        adapter_props = _adapter_props(bus)
+        log.warning(
+            "Resetting Bluetooth adapter after advertisement registration failure"
+        )
+        _set_adapter_powered(adapter_props, False)
+        time.sleep(_ADAPTER_RESET_SETTLE_DELAY)
+        if _set_adapter_powered(adapter_props, True):
+            _stop_adapter_discovery(bus)
+    except Exception as exc:
+        log.warning(
+            "Bluetooth adapter reset after advertisement failure failed: %s", exc
+        )
 
 
 def _remove_stale_bonds(bus: "dbus.SystemBus") -> None:
@@ -646,6 +680,10 @@ class Proxy:
                 return server
             except Exception as exc:
                 await self._cleanup_failed_ble_start(server)
+                if _is_advertisement_registration_failure(exc):
+                    await asyncio.to_thread(
+                        _recover_adapter_after_advertisement_failure
+                    )
                 if attempt >= 3:
                     raise
                 log.warning("BLE start attempt %d/3 failed (%s) — retrying in 3 s",
