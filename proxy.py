@@ -43,6 +43,7 @@ from bless import (
     GATTAttributePermissions,
     GATTCharacteristicProperties,
 )
+from bless.backends.bluezdbus.dbus.advertisement import BlueZLEAdvertisement
 
 NUS_SERVICE_UUID  = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # phone → companion
@@ -71,8 +72,20 @@ TCP_READ_SIZE       = 512 # bytes per read from companion
 
 BLE_NOTIFY_QUEUE_MAXSIZE = 256   # backpressure cap; drops oldest on overflow
 BLE_INTER_NOTIFY_DELAY   = 0.020 # 20 ms — one BLE connection interval
+BLE_START_RETRY_DELAY    = 3.0   # seconds between BLE advertising retries
 
 log = logging.getLogger("meshcore-proxy")
+
+# Bless exports BlueZ's experimental LEAdvertisement1 TxPower/MinInterval/
+# MaxInterval properties by default.  On Raspberry Pi/BlueZ this makes the
+# advertisement either require unsupported experimental fields or exceed the
+# legacy 31-byte advertising payload once the NUS 128-bit UUID and "MeshCore"
+# local name are included, and BlueZ reports only the vague
+# "Failed to register advertisement" error.  Disable those fields so the
+# advertisement contains only the stable peripheral type, service UUID, and
+# local name.
+for _advertisement_property in ("TxPower", "MinInterval", "MaxInterval"):
+    getattr(BlueZLEAdvertisement, _advertisement_property).disabled = True
 
 
 # ---------------------------------------------------------------------------
@@ -686,9 +699,11 @@ class Proxy:
                     )
                 if attempt >= 3:
                     raise
-                log.warning("BLE start attempt %d/3 failed (%s) — retrying in 3 s",
-                            attempt, exc)
-                await asyncio.sleep(3)
+                log.warning(
+                    "BLE start attempt %d/3 failed (%s) — retrying in %.0f s",
+                    attempt, exc, BLE_START_RETRY_DELAY,
+                )
+                await asyncio.sleep(BLE_START_RETRY_DELAY)
 
         raise RuntimeError("unreachable BLE start retry state")
 
