@@ -220,31 +220,46 @@ def _ensure_adapter_powered() -> bool:
         return False
 
 
-def _configure_adapter(bus: "dbus.SystemBus") -> None:
-    """Prepare hci0 for pairing and advertising without leaving it off."""
-    adapter_props = _adapter_props(bus)
+def _stop_adapter_discovery(bus: "dbus.SystemBus") -> None:
+    """Stop active Bluetooth discovery before registering LE advertising.
 
-    # Power-cycle only when the controller is already powered.  If powering off
-    # succeeds but powering back on is transiently rejected, keep retrying so a
-    # failed cleanup attempt does not cause the next RegisterAdvertisement call
-    # to fail with the unhelpful "Failed to register advertisement" error.
+    Some Raspberry Pi/BlueZ combinations report a generic
+    ``Failed to register advertisement`` error if inquiry/discovery is active
+    while a peripheral advertisement is being registered.  Stopping discovery
+    is harmless when nothing is scanning and avoids touching Wi-Fi networking.
+    """
     try:
-        if _adapter_is_powered(adapter_props):
-            if _set_adapter_powered(adapter_props, False, retries=2, retry_delay=0.5):
-                time.sleep(0.5)
+        adapter = dbus.Interface(
+            bus.get_object("org.bluez", _ADAPTER_PATH),
+            _ADAPTER_IFACE,
+        )
+        adapter.StopDiscovery()
+        log.debug("Stopped active Bluetooth discovery before advertising")
     except Exception as exc:
-        log.warning("Adapter power-cycle precheck failed: %s", exc)
+        # BlueZ raises org.bluez.Error.Failed when discovery was not running.
+        log.debug("Bluetooth discovery stop skipped: %s", exc)
+
+
+def _configure_adapter(bus: "dbus.SystemBus") -> None:
+    """Prepare hci0 for pairing and advertising without disturbing Wi-Fi."""
+    adapter_props = _adapter_props(bus)
 
     if not _set_adapter_powered(adapter_props, True):
         log.warning("Adapter is not powered; BLE advertisement registration may fail")
         return
 
+    _stop_adapter_discovery(bus)
+
     try:
         adapter_props.Set(_ADAPTER_IFACE, "Pairable", dbus.Boolean(True))
         adapter_props.Set(_ADAPTER_IFACE, "PairableTimeout", dbus.UInt32(0))
-        adapter_props.Set(_ADAPTER_IFACE, "Discoverable", dbus.Boolean(True))
+        # LE advertisements are discoverable by themselves.  Do not force
+        # BR/EDR discoverable mode here; on Pi combo radios it can contend with
+        # LE advertising and surface as BlueZ's vague
+        # "Failed to register advertisement" error.
+        adapter_props.Set(_ADAPTER_IFACE, "Discoverable", dbus.Boolean(False))
         adapter_props.Set(_ADAPTER_IFACE, "DiscoverableTimeout", dbus.UInt32(0))
-        log.info("Adapter set to powered, always-pairable, and always-discoverable")
+        log.info("Adapter set to powered and always-pairable")
     except Exception as exc:
         log.warning("Could not configure adapter properties: %s", exc)
 
@@ -620,6 +635,10 @@ class Proxy:
         for attempt in range(1, 4):
             if _DBUS_AVAILABLE:
                 await asyncio.to_thread(_ensure_adapter_powered)
+                try:
+                    await asyncio.to_thread(_stop_adapter_discovery, dbus.SystemBus())
+                except Exception as exc:
+                    log.debug("Bluetooth discovery pre-start cleanup skipped: %s", exc)
             server = await self._build_ble_server()
             try:
                 await server.start()
